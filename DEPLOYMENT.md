@@ -84,5 +84,5 @@ Khai báo trong `06-lab-complete/render.yaml`; **không có giá trị secret n�
 ## Screenshots
 
 - [Deployment dashboard](screenshots/dashboard.png): trang `ai-agent` trên Render, trạng thái Live, URL và commit
-- [Service running](screenshots/running.png): log hoặc events của service đang chạy
+- [Service running](screenshots/running.png): trình duyệt gọi `GET /health` trên URL public, trả `status: ok`, `environment: production`
 - [Test results](screenshots/test.png): kết quả bốn lệnh kiểm tra (200, 200, 401, 200)

@@ -215,7 +215,7 @@ POST /ask (có key đúng)    -> 200
 
 `python check_production_ready.py --public-url https://ai-agent-phqg.onrender.com` (bản đầy đủ): **PASS 12/12**, 44/44 kiểm tra, gồm `Public URL: GET .../health → 200`.
 
-Ảnh chụp: `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png`. Chi tiết lệnh và biến môi trường nằm trong `DEPLOYMENT.md`.
+Ảnh chụp: `screenshots/dashboard.png` (trang service trên Render), `screenshots/running.png` (trình duyệt gọi `/health` trên URL public) và `screenshots/test.png` (bốn lệnh kiểm tra). Chi tiết lệnh và biến môi trường nằm trong `DEPLOYMENT.md`.
 
 Lưu ý: trang `/docs` (Swagger của FastAPI) đang truy cập được công khai trên URL này (trả 200). Nó không lộ secret, nhưng với production nghiêm túc nên tắt.
 
