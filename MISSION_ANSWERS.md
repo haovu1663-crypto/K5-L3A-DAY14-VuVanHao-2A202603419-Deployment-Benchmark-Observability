@@ -200,11 +200,217 @@ _(chưa làm)_
 
 ## Part 4: API Security
 
-_(chưa làm)_
+> Mọi output dưới đây do tôi chạy thật trên máy (Windows, Python 3.12, chạy `python app.py` trực tiếp). Token JWT đã được che.
+
+### Exercise 4.1: API Key authentication (`04-api-gateway/develop/app.py`)
+
+- **API key được check ở đâu?** Trong hàm `verify_api_key` (dòng 39–54), đọc header `X-API-Key` bằng `APIKeyHeader(auto_error=False)` rồi so với biến `API_KEY`. Hàm này được gắn vào `/ask` bằng `Depends(verify_api_key)`. `/` và `/health` để public.
+- **Sai key thì sao?** Thiếu key trả **401**, có key nhưng sai trả **403**.
+- **Rotate key thế nào?** Key đọc từ biến môi trường `AGENT_API_KEY`, nên chỉ cần đặt giá trị mới rồi khởi động lại, không sửa code. Thực tế nên cho phép hai key cùng hợp lệ trong lúc chuyển đổi để client cũ không bị lỗi, rồi mới huỷ key cũ.
+
+Chạy: `AGENT_API_KEY=secret-key-123 python app.py`. Bản này đọc JSON body:
+
+```text
+# Không có key
+HTTP/1.1 401 Unauthorized
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+# Sai key (X-API-Key: wrong-key)
+HTTP/1.1 403 Forbidden
+{"detail":"Invalid API key."}
+
+# Đúng key (X-API-Key: secret-key-123)
+HTTP/1.1 200 OK
+{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+### Exercise 4.2: JWT authentication (`04-api-gateway/production/`)
+
+Luồng JWT (đọc `auth.py`): client gửi username và password tới `POST /auth/token`; server kiểm tra rồi ký một token chứa `user_id`, `role` và thời điểm hết hạn (60 phút); client gửi token ở header `Authorization: Bearer <token>`; mỗi request server chỉ xác minh chữ ký và hạn, không cần tra database.
+
+```text
+# /ask không có token
+HTTP/1.1 401 Unauthorized
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+# Đăng nhập sai mật khẩu
+HTTP/1.1 401 Unauthorized
+{"detail":"Invalid credentials"}
+
+# Đăng nhập student / demo123
+HTTP 200, access_token = eyJ... (đã che, dài 168 ký tự)
+```
+
+Dùng token để gọi `/ask`: trả 200 với `usage.requests_remaining` giảm dần (xem 4.3).
+
+**Phân quyền theo role:** `student` (role `user`) gọi `GET /admin/stats` nhận `403 {"detail":"Admin only"}`.
+
+### Exercise 4.3: Rate limiting (`rate_limiter.py`)
+
+- **Thuật toán:** Sliding Window Counter. Mỗi user có một `deque` chứa timestamp các request; mỗi lần gọi bỏ các timestamp ngoài cửa sổ 60 giây rồi đếm.
+- **Giới hạn:** `student` (role `user`) **10 request/phút**; `teacher` (role `admin`) **100 request/phút** (`rate_limiter_user` và `rate_limiter_admin`).
+- **Bypass cho admin:** không bypass hoàn toàn. Admin dùng một limiter khác có ngưỡng cao hơn, chọn theo `role` trong token (`limiter = rate_limiter_admin if role == "admin" else rate_limiter_user`).
+
+Gọi liên tục 20 request bằng token `student`:
+
+```text
+ 1 -> 200  requests_remaining=9
+ 2 -> 200  requests_remaining=8
+ ...
+10 -> 200  requests_remaining=0
+11 -> 429  {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":39}}
+12 -> 429  ...
+...
+20 -> 429  {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":20}}
+```
+
+Header của một response 429:
+
+```text
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795599133
+retry-after: 20
+```
+
+Request thứ 11 bị chặn đúng như ngưỡng 10 request/phút. Số giây `retry_after_seconds` giảm dần theo thời gian. Với `teacher`, 15 request liên tiếp đều trả 200 (ngưỡng 100/phút).
+
+Lưu ý: limiter này lưu trong **bộ nhớ của tiến trình** (`defaultdict(deque)`). Khi chạy nhiều instance hoặc nhiều worker, mỗi instance đếm riêng nên giới hạn không còn chính xác, và restart là mất bộ đếm. Vì vậy Part 6 yêu cầu lưu trong Redis.
+
+### Exercise 4.4: Cost guard
+
+**Cách tiếp cận trong repo (`cost_guard.py`):** mỗi request, `check_budget(user_id)` chạy **trước khi** gọi LLM; sau khi gọi xong, `record_usage` cộng chi phí tính theo token (`input/1000 × 0.00015 + output/1000 × 0.0006`). Có hai tầng:
+1. Ngân sách **từng user: $1/ngày** — vượt thì trả **402 Payment Required**.
+2. Ngân sách **toàn hệ thống: $10/ngày** — vượt thì trả **503**.
+Khi dùng tới 80% ngân sách thì ghi log cảnh báo. Bộ đếm tự đặt lại khi sang ngày mới (so sánh chuỗi ngày `YYYY-MM-DD`).
+
+Tôi minh hoạ 402 bằng cách tạo `CostGuard(daily_budget_usd=0.001)` rồi gọi lặp lại:
+
+```text
+1 OK  cost= 0.00075
+2 OK  cost= 0.0015
+3 HTTP 402 {'error': 'Daily budget exceeded', 'used_usd': 0.0015, 'budget_usd': 0.001, 'resets_at': 'midnight UTC'}
+```
+
+Lưu ý khi đọc kết quả: request số 2 vẫn được qua dù tổng đã vượt $0.001, vì `check_budget` chỉ kiểm tra chi phí **đã dùng** trước khi gọi, không ước lượng chi phí của request sắp chạy. Vì vậy mỗi user có thể vượt ngân sách tối đa một request.
+
+**Khác với đề trong `CODE_LAB.md`:** đề mô tả cost guard theo **tháng, $10/user, lưu bằng Redis** (khoá `budget:{user}:{YYYY-MM}`, `INCRBYFLOAT`, `EXPIRE` 32 ngày). Bản trong repo là **theo ngày, $1/user, lưu in-memory**. Cách Redis đúng hơn cho production vì state sống sót qua restart và dùng chung được giữa nhiều instance; tôi chưa chạy bản Redis ở bài này, sẽ làm ở Part 6.
+
+**Vì sao cần cả rate limit và cost guard:** rate limit bảo vệ **tốc độ** (chặn spam, bảo vệ server và bị giới hạn theo phút), còn cost guard bảo vệ **tiền** (chặn tổng chi phí LLM). Một user có thể gửi vài request mỗi phút, không bao giờ chạm rate limit, nhưng mỗi request là prompt rất dài và vẫn tiêu hết ngân sách. Ngược lại, rate limit không biết request đắt hay rẻ. Cần cả hai.
+
+### Checkpoint 3: tự kiểm tra
+
+- Đã thấy **429** từ vòng lặp gọi liên tục do tôi chạy (request thứ 11).
+- Đã thấy cả ba mã của API key: 401 (thiếu), 403 (sai), 200 (đúng).
+- Cần hiểu: 401 là chưa xác thực, 403 là đã xác thực nhưng không đủ quyền hoặc sai key, 429 là quá nhiều request, 402 là hết ngân sách.
 
 ## Part 5: Scaling & Reliability
 
-_(chưa làm)_
+> **Ghi chú về cách chạy trên máy tôi (3 điểm khác hướng dẫn gốc):**
+> 1. **Build image offline.** Như ở Part 2, container Docker trên máy tôi không có mạng, nên `pip install` trong `docker build` thất bại. Tôi build bằng Dockerfile tạm đặt ngoài repo, dùng wheel tải sẵn (bỏ thêm lệnh `apt-get gcc` ở stage builder, stage này không vào image cuối). Dockerfile gốc không bị sửa.
+> 2. **Cổng 8090 thay vì 8080.** Cổng 8080 trên máy tôi đang bị một container khác (không thuộc lab) dùng. Tôi giữ nguyên container đó và publish Nginx của stack lab ở cổng **8090** bằng một file `override` đặt ngoài repo. `test_stateless.py` gốc cứng cổng 8080, nên tôi chạy một bản sao chỉ đổi cổng sang 8090 (file gốc không sửa).
+> 3. **SIGTERM thật cho Exercise 5.2.** Windows không gửi SIGTERM thật như Linux, nên tôi chạy `develop/app.py` bên trong một container Linux (mount thư mục `develop/`, chạy `python app.py`) và dùng `docker stop`, lệnh này gửi SIGTERM thật.
+
+### Exercise 5.1: Health và readiness (`05-scaling-reliability/develop/app.py`)
+
+```text
+GET /health -> 200
+{"status":"ok","uptime_seconds":1.0,"version":"1.0.0","environment":"development","timestamp":"...","checks":{"memory":{"status":"ok","note":"psutil not installed"}}}
+
+GET /ready  -> 200
+{"ready":true,"in_flight_requests":1}
+```
+
+- **`/health` (liveness probe):** trả lời "process còn sống không". Trả 200 khi process chạy, kèm uptime, version, trạng thái các kiểm tra (ví dụ bộ nhớ). Nền tảng gọi định kỳ; nếu lỗi hoặc timeout thì **restart container**.
+- **`/ready` (readiness probe):** trả lời "sẵn sàng nhận traffic chưa". Trả **503** khi đang khởi động hoặc đang shutdown (cờ `_is_ready = False`), trả 200 khi sẵn sàng. Load balancer dùng để quyết định **có đưa traffic vào instance này không**, nhưng không restart nó.
+- Khác biệt: instance chưa sẵn sàng thì không hỏng, chỉ cần tạm thời không nhận traffic; còn instance không trả lời `/health` thì mới cần restart.
+
+(Giá trị `in_flight_requests: 1` là chính request `/ready` đang gọi, vì middleware đếm cả nó.)
+
+### Exercise 5.2: Graceful shutdown
+
+Trong `develop/app.py`, `/ask` có độ trễ giả lập 3 giây. Tôi gửi một request chậm, một giây sau chạy `docker stop` (SIGTERM):
+
+```text
+in-flight request -> HTTP 200 after 3.05s
+docker stop xong sau 2.58 giay
+exit code = 0
+
+Log container:
+INFO:     Shutting down
+INFO:     172.17.0.1:33128 - "POST /ask?question=Long%20task" 200 OK
+INFO:     Waiting for application shutdown.
+... 🔄 Graceful shutdown initiated...
+... ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1]
+... Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+**Kết luận:** request đang chạy **được hoàn thành** (200 sau 3,05 giây) dù SIGTERM tới sau 1 giây. Container thoát **sạch với exit code 0**, không bị cắt ngang. Thứ tự: uvicorn nhận SIGTERM → ngừng nhận kết nối mới → chờ request đang chạy xong → chạy phần shutdown của `lifespan` (đặt `_is_ready=False`, chờ `_in_flight_requests` về 0, tối đa 30 giây) → thoát. Nếu không có graceful shutdown (ví dụ `SIGKILL`), request kia sẽ mất và client nhận lỗi kết nối.
+
+### Exercise 5.3: Stateless design (`05-scaling-reliability/production/app.py`)
+
+- Bản production lưu session và lịch sử hội thoại **trong Redis** (`save_session`, `load_session`, `append_to_history`; khoá `session:{id}`, có TTL 1 giờ), không giữ trong biến của tiến trình. Response có trường `"storage": "redis"` để xác nhận.
+- **Vì sao state trong RAM hỏng khi scale:** mỗi instance có bộ nhớ riêng. Nếu lịch sử nằm trong một `dict` của instance A, request tiếp theo do load balancer chuyển tới instance B sẽ **không thấy** lịch sử đó; khi A bị restart hoặc scale in thì mất luôn. Đưa state ra Redis dùng chung thì instance nào cũng đọc ghi được, nên có thể thêm, bớt, restart instance tuỳ ý.
+- Ngoài ra `/health` và `/ready` của bản này kiểm tra cả kết nối Redis (`redis_connected`), nên instance mất Redis sẽ báo `degraded` hoặc 503.
+
+### Exercise 5.4: Load balancing
+
+Stack: `redis`, `nginx` và `agent` với 3 instance (`docker compose -p k5-day14-scaling up -d --scale agent=3`). Cả 3 agent đều `healthy`. Chỉ Nginx publish cổng ra ngoài (8090 trên máy tôi; 8080 theo hướng dẫn gốc).
+
+Gọi 10 request `POST /chat` (mỗi request một session mới), cột 2 là `served_by`:
+
+```text
+1 instance-200a8e   2 instance-601a48   3 instance-e001dd
+4 instance-200a8e   5 instance-601a48   6 instance-e001dd
+7 instance-200a8e   8 instance-601a48   9 instance-e001dd
+10 instance-200a8e
+Phân bố: instance-200a8e = 4, instance-601a48 = 3, instance-e001dd = 3
+```
+
+Nginx chia **luân phiên (round-robin)** đều cho 3 instance. Response cũng có header `X-Served-By: <ip>:8000` do Nginx thêm vào.
+
+### Exercise 5.5: Test stateless (`test_stateless.py`)
+
+Gửi 5 câu trong **cùng một session**. Kết quả:
+
+```text
+Request 1: [instance-e001dd]   Request 2: [instance-200a8e]   Request 3: [instance-601a48]
+Request 4: [instance-e001dd]   Request 5: [instance-200a8e]
+Instances used: {'instance-601a48', 'instance-e001dd', 'instance-200a8e'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10   (5 user + 5 assistant, đúng thứ tự)
+✅ Session history preserved across all instances via Redis!
+```
+
+**Giải thích:** 5 request của cùng một session đi qua cả 3 instance khác nhau, nhưng khi đọc lại history vẫn thấy đủ 10 tin nhắn. Điều đó chứng minh state **không nằm trong bộ nhớ của từng instance** mà nằm trong Redis dùng chung. Script này không tự tắt instance nào.
+
+**Thử nghiệm thêm: tắt một instance giữa chừng** (script riêng do tôi viết, không thuộc lab). Gửi 3 request, `docker stop` một agent, rồi gửi tiếp 6 request cùng session:
+
+```text
+truoc khi tat: Q1..Q3 (3 instance khác nhau)
+>>> docker stop k5-day14-scaling-agent-1
+sau khi tat : Q4 OK, Q5 OK, Q6 LOI (timed out), Q7 OK, Q8 OK, Q9 OK
+ok=5 loi=1; history count=16
+```
+
+- **Dữ liệu không mất:** các request sau đó vẫn thành công và nối tiếp đúng session. History gồm 16 tin nhắn = 8 lượt hoàn thành × 2 (3 trước khi tắt + 5 thành công sau đó). Lượt Q6 lỗi nên không để lại gì trong history.
+- **Nhưng có một request bị treo:** Q6 bị timeout ở phía client (tôi đặt 30 giây). Nginx vẫn gửi một request tới instance vừa bị tắt, và phải chờ hết thời gian kết nối (mặc định 60 giây) mới chuyển sang instance khác. `nginx.conf` có `proxy_next_upstream error timeout http_503` nên về lý thuyết sẽ thử instance khác, nhưng chỉ sau khi timeout kết nối. Nếu muốn giảm độ trễ này, cần đặt `proxy_connect_timeout` ngắn hơn (ví dụ 2–3 giây) và/hoặc `max_fails`, `fail_timeout` cho upstream. Tôi chỉ quan sát chứ chưa sửa cấu hình.
+- Chỉ có 1 lần xảy ra trong lần chạy này; tôi chưa lặp lại để đo xác suất.
+
+Sau khi xong tôi đã dọn bằng `docker compose -p k5-day14-scaling ... down -v` và xoá image tạm.
+
+### Checkpoint 4: tự kiểm tra
+
+- **Liveness (`/health`) khác readiness (`/ready`):** liveness quyết định có **restart** không; readiness quyết định có **đưa traffic vào** không.
+- **Graceful shutdown:** đã quan sát request đang chạy hoàn thành và container thoát với exit code 0.
+- **Stateless:** state phải nằm ở nơi dùng chung (Redis); nếu nằm trong RAM của instance thì scale ngang sẽ làm lệch hoặc mất dữ liệu.
+- **Load balancing với Nginx:** round-robin đều cho 3 instance (4/3/3 trong 10 request).
+- **Kết quả test stateless:** `test_stateless.py` cho thấy cùng một session đi qua 3 instance mà history vẫn đủ 10 tin nhắn.
 
 ## Part 6: Output `check_production_ready.py`
 
@@ -214,5 +420,7 @@ _(chưa làm)_
 
 | Lần | Hỏi gì | Nhận gì | Tôi tự sửa / kiểm tra thế nào |
 |-----|--------|---------|-------------------------------|
+| 4 | Làm Part 5: đọc code health/ready, graceful shutdown, Redis session, nginx; chạy develop trong container để gửi SIGTERM thật; dựng stack 3 agent + Redis + Nginx, chạy `test_stateless.py`; thử tắt một instance | Câu trả lời 5.1–5.5, cách xử lý lỗi mạng Docker (build offline), xung đột cổng 8080 (đổi sang 8090 bằng file override ngoài repo) | Tự chạy mọi lệnh và lấy output thật. Bản sao `test_stateless.py` đổi cổng 8080→8090 (file gốc không sửa). Thử nghiệm tắt instance là script do tôi viết thêm, không thuộc lab. Cần bạn đọc lại và xác nhận. |
+| 3 | Làm Part 4: đọc code API key, JWT, rate limiter, cost guard; chạy server và test 401/403/200/429/402; viết phần Part 4 | Câu trả lời 4.1–4.4 và các lệnh test | Tự chạy server, curl và script Python; lần đầu vòng lặp bị 422 do tôi quote JSON sai trong PowerShell, đã chạy lại bằng script Python. 402 minh hoạ bằng cách gọi trực tiếp `CostGuard` (không qua HTTP). Cần bạn đọc lại và xác nhận. |
 | 2 | Làm Part 2: đọc Dockerfile/compose, build và đo image, chạy container và stack, viết phần Part 2 | Câu trả lời 2.1–2.4, cách xử lý lỗi mạng Docker (build offline bằng wheel tải sẵn, Dockerfile tạm đặt ngoài repo), sơ đồ stack | Tự chạy các lệnh build, `docker images`, curl, `docker compose`. Số MB lấy từ output thật. Cần bạn đọc lại và xác nhận trước khi nộp. |
 | 1 | Đọc `develop/app.py` và `production/app.py`, liệt kê anti-pattern, viết phần Part 1 | Danh sách anti-pattern, bảng so sánh, câu trả lời Checkpoint 1 | Chạy lại bản develop để lấy output curl và log thật. Số dòng code đối chiếu trực tiếp với file. _(Bạn cần đọc lại và xác nhận trước khi nộp.)_ |
