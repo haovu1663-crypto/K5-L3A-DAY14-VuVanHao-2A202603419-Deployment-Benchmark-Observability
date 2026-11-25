@@ -196,7 +196,62 @@ Xong thì tôi đã dọn bằng `docker compose -p k5-day14-docker down -v`.
 
 ## Part 3: Cloud Deployment
 
-_(chưa làm)_
+Nền tảng chính: **Render** (deploy chính agent Part 6 trong `06-lab-complete/`, không deploy app mẫu của `03-cloud-deployment/`).
+
+### Kết quả deploy trên Render
+
+- **URL public:** https://ai-agent-phqg.onrender.com
+- **Cách deploy:** Render → New → Blueprint, repo của tôi, nhánh `main`, **Blueprint Path = `06-lab-complete/render.yaml`** (file nằm trong thư mục con nên phải chỉ đường dẫn; để trống thì Render báo `render.yaml not found on main branch`). Render đọc được file và liệt kê đúng hai tài nguyên: Key Value `agent-redis` và web service `ai-agent`. Sync hoàn tất, build Docker và deploy mất **1 phút 9 giây**, trạng thái **Live**. Redis (Valkey 8.1.10, vùng Singapore) ở trạng thái **Available**.
+- **Biến môi trường** đặt qua `render.yaml`, không có secret trong repo: `AGENT_API_KEY` do Render tự sinh (`generateValue: true`), `REDIS_URL` lấy từ `agent-redis` qua `fromService`.
+
+Bốn lệnh tự kiểm (key được nhập bằng ô ẩn, không lộ):
+
+```text
+GET  /health               -> 200
+GET  /ready                -> 200   (agent trên Render kết nối được Redis)
+POST /ask (không có key)   -> 401
+POST /ask (có key đúng)    -> 200
+```
+
+`python check_production_ready.py --public-url https://ai-agent-phqg.onrender.com` (bản đầy đủ): **PASS 12/12**, 44/44 kiểm tra, gồm `Public URL: GET .../health → 200`.
+
+Ảnh chụp: `screenshots/dashboard.png`, `screenshots/running.png`, `screenshots/test.png`. Chi tiết lệnh và biến môi trường nằm trong `DEPLOYMENT.md`.
+
+Lưu ý: trang `/docs` (Swagger của FastAPI) đang truy cập được công khai trên URL này (trả 200). Nó không lộ secret, nhưng với production nghiêm túc nên tắt.
+
+### So sánh `railway.toml` và `render.yaml`
+
+So sánh hai file cấu hình của Part 6 (`06-lab-complete/railway.toml` và `06-lab-complete/render.yaml`), có đối chiếu với hai file mẫu trong `03-cloud-deployment/`:
+
+| Điểm so sánh | `railway.toml` | `render.yaml` |
+|--------------|----------------|---------------|
+| Định dạng | TOML, ngắn: chỉ hai mục `[build]` và `[deploy]` | YAML dạng Blueprint (Infrastructure as Code), mô tả cả hệ thống |
+| Phạm vi | Chỉ cấu hình **cách build và chạy một service** | Khai báo **nhiều tài nguyên** trong một file: web service **và** Redis (`type: keyvalue`), cùng biến môi trường |
+| Chọn cách build | `builder = "DOCKERFILE"` (mẫu của lớp dùng `NIXPACKS` + `startCommand`) | `runtime: docker` + `dockerfilePath` / `dockerContext` (mẫu dùng `runtime: python` + `buildCommand` / `startCommand`) |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout = 30` | `healthCheckPath: /health` (khác cách viết hoa chữ C) |
+| Khởi động lại khi lỗi | Khai báo rõ: `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không khai báo trong file; nền tảng tự restart khi health check thất bại |
+| Biến môi trường và secret | **Không có** trong file; đặt bằng dashboard hoặc `railway variables set ...` | Khai báo ngay trong file: giá trị thường (`value`), secret tự sinh (`generateValue: true`) hoặc nhập tay (`sync: false`) |
+| Redis | Không khai báo trong file; phải tự thêm Redis plugin trong dashboard rồi trỏ `REDIS_URL` | Khai báo trong file, và nối vào agent bằng `fromService` (`property: connectionString`) |
+| Cách kích hoạt deploy | Dùng CLI: `railway up` | Push lên GitHub, Render đọc Blueprint rồi tự deploy (`autoDeploy: true`) |
+| Cổng | Railway cấp biến `PORT`; app đọc qua `${PORT:-8000}` trong CMD | Render cũng cấp biến `PORT`; dùng chung CMD |
+
+**Vì sao khác nhau:** Railway coi file cấu hình là phần "build và chạy một service", còn hạ tầng (Redis, biến) tạo bằng dashboard hoặc CLI. Render đi theo hướng Infrastructure as Code: một file `render.yaml` được commit vào git là đủ để dựng lại cả hệ thống (web + Redis + biến) bằng một Blueprint. Cái giá của Render là file dài hơn và phải khai báo đúng cú pháp riêng của nó; cái lợi là không phải bấm tay nhiều bước và cấu hình được kiểm soát bằng git. Với đề bài này, agent cần Redis nên cách của Render gọn hơn.
+
+Điểm giống nhau quan trọng: cả hai đều **không ghi secret vào file**, đều gọi `/health` để biết service còn sống và đều cấp biến `PORT`.
+
+### Exercise 3.3: Pipeline CI/CD của Cloud Run (`cloudbuild.yaml` và `service.yaml`)
+
+Tôi chỉ đọc hai file này, không deploy (không cần tài khoản GCP).
+
+**`cloudbuild.yaml`** là pipeline CI/CD, kích hoạt khi push lên nhánh `main`. Bốn bước chạy tuần tự (mỗi bước có `waitFor` bước trước):
+1. **test:** cài `requirements.txt` và chạy `pytest tests/`. Test thất bại thì pipeline dừng, không build.
+2. **build:** `docker build`, gắn hai tag `ai-agent:$COMMIT_SHA` và `ai-agent:latest`, dùng `--cache-from` image `latest` để tận dụng cache layer.
+3. **push:** đẩy mọi tag lên Container Registry (`gcr.io/$PROJECT_ID/ai-agent`).
+4. **deploy:** `gcloud run deploy` với image theo `COMMIT_SHA`, vùng `asia-southeast1`, `--min-instances=1` (tránh cold start), `--max-instances=10` (giới hạn chi phí), và lấy `OPENAI_API_KEY` từ **Secret Manager** (`--set-secrets`) thay vì ghi trong file.
+
+**`service.yaml`** là định nghĩa Cloud Run dạng khai báo (kiểu Knative Service, `gcloud run services replace`): autoscaling từ 1 tới 10 instance, mỗi instance xử lý tối đa 80 request đồng thời, timeout 60 giây, giới hạn CPU và bộ nhớ, secret (`OPENAI_API_KEY`, `AGENT_API_KEY`) lấy qua `secretKeyRef`, `livenessProbe` gọi `/health` và `startupProbe` gọi `/ready`.
+
+Nhận xét: tag bằng `COMMIT_SHA` giúp truy ngược bản chạy về đúng commit và rollback dễ. Trong thư mục `production-cloud-run/` **không có thư mục `tests/`**, nên bước 1 sẽ thất bại nếu chạy đúng như đang viết; muốn dùng thật phải thêm test hoặc bỏ bước này.
 
 ## Part 4: API Security
 
@@ -494,12 +549,13 @@ Log container: mỗi dòng là một object JSON hợp lệ
 - **Python của WSL:** bản mặc định là 3.14, không cài được `pydantic==2.9.0` trong `requirements.txt`. Tôi tạo virtualenv Python 3.11 bằng `uv` tại `~/k5-venv` (ngoài repo) để chạy script chấm.
 - **Cost guard có thể vượt budget một chút:** `check_budget()` chạy trước và `record_cost()` chạy sau khi gọi LLM, nên request chạy song song có thể làm tổng vượt ngưỡng một ít. Muốn chặt hơn cần "đặt trước" chi phí ước tính trước khi gọi.
 - **Số token là ước lượng:** mock LLM không trả số token thật, nên tôi ước lượng ~4 ký tự mỗi token.
-- **`render.yaml` chưa được thử trên Render thật:** script chấm chỉ kiểm tra cú pháp ở mức tĩnh. Các đường dẫn Docker và cú pháp Redis (Key Value) trong file này cần xác nhận khi deploy ở Part 3.
+- **`render.yaml`:** script chấm chỉ kiểm tra cú pháp ở mức tĩnh, nhưng file này sau đó đã được Render chấp nhận và deploy thành công ở Part 3 (xem mục Part 3).
 
 ## AI log
 
 | Lần | Hỏi gì | Nhận gì | Tôi tự sửa / kiểm tra thế nào |
 |-----|--------|---------|-------------------------------|
+| 6 | Làm Part 3: viết phần so sánh `railway.toml` / `render.yaml` và phần Cloud Run, hướng dẫn từng bước deploy Render, kiểm tra URL public, viết `DEPLOYMENT.md` | Nội dung mục Part 3, `DEPLOYMENT.md`, script kiểm tra URL có nhập key bằng ô ẩn | Bạn tự thao tác trên Render và tự nhập key; tôi chỉ đọc mã HTTP (không thấy key). Bốn kết quả 200, 200, 401, 200 lấy từ file kết quả script và ảnh `test.png` của bạn; `check_production_ready.py --public-url` chạy lại → PASS 12/12. Cần bạn đọc lại và xác nhận. |
 | 5 | Làm Part 6: viết code cho các chỗ TODO trong `06-lab-complete/` (config, auth, rate limiter Redis/Lua, cost guard, log JSON, health/ready, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`); dựng môi trường WSL để chạy script chấm | Toàn bộ code và cấu hình của Part 6, lệnh chạy script chấm trong WSL | Đọc kỹ các phép kiểm tra của script chấm trước khi viết. Chạy script chấm đầy đủ → PASS 12/12, không sửa script. Tự chạy `docker compose up` và thử các trường hợp lỗi (401, 422, 429, Redis chết). Cần bạn đọc và hiểu từng file trong `06-lab-complete/app/` vì Lab Coach có thể hỏi giải thích. |
 | 4 | Làm Part 5: đọc code health/ready, graceful shutdown, Redis session, nginx; chạy develop trong container để gửi SIGTERM thật; dựng stack 3 agent + Redis + Nginx, chạy `test_stateless.py`; thử tắt một instance | Câu trả lời 5.1–5.5, cách xử lý lỗi mạng Docker (build offline), xung đột cổng 8080 (đổi sang 8090 bằng file override ngoài repo) | Tự chạy mọi lệnh và lấy output thật. Bản sao `test_stateless.py` đổi cổng 8080→8090 (file gốc không sửa). Thử nghiệm tắt instance là script do tôi viết thêm, không thuộc lab. Cần bạn đọc lại và xác nhận. |
 | 3 | Làm Part 4: đọc code API key, JWT, rate limiter, cost guard; chạy server và test 401/403/200/429/402; viết phần Part 4 | Câu trả lời 4.1–4.4 và các lệnh test | Tự chạy server, curl và script Python; lần đầu vòng lặp bị 422 do tôi quote JSON sai trong PowerShell, đã chạy lại bằng script Python. 402 minh hoạ bằng cách gọi trực tiếp `CostGuard` (không qua HTTP). Cần bạn đọc lại và xác nhận. |
