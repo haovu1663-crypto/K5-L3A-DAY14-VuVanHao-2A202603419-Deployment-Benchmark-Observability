@@ -414,12 +414,93 @@ Sau khi xong tôi đã dọn bằng `docker compose -p k5-day14-scaling ... down
 
 ## Part 6: Output `check_production_ready.py`
 
-_(chưa làm)_
+Chạy trong `06-lab-complete/`, **chế độ đầy đủ** (không `--skip-docker`, không `--static-only`), trên WSL2 Ubuntu với Python 3.11 (`os.name` = `posix`) và Docker Desktop. Kết quả: **PASS 12/12**, 43/43 kiểm tra. Image build ra nặng **63 MB**, `docker stop` mất **1,2 giây** với exit code 0.
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+Các dòng chi tiết đáng chú ý của lần chạy này:
+
+```text
+Docker: build image thành công — 44s
+Docker: image < 500 MB — 63 MB
+Rate limiting: 429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)
+Rate limiting: restart agent vẫn bị 429 (state nằm trong Redis)
+Cost guard: 402 ở request thứ 1 (budget 0.000001 USD)
+Structured logging: 12 dòng JSON
+Graceful shutdown: SIGTERM lúc đang có request → request vẫn 200, exit code 0
+Graceful shutdown: `docker stop` exit code 0, 1.2s
+```
+
+`check_production_ready.py` **không bị sửa** (`git diff` trên file này trống).
+
+### Các quyết định thiết kế
+
+| Thành phần | Cách làm | Lý do |
+|------------|----------|-------|
+| `config.py` | Mọi giá trị đọc bằng `os.getenv`, có giá trị mặc định cho local. `AGENT_API_KEY` mặc định là chuỗi rỗng. | Không có secret trong code. Key rỗng nghĩa là "chưa cấu hình" và app từ chối mọi `/ask`, thay vì mở toang. |
+| `auth.py` | `APIKeyHeader(auto_error=False)`, tự raise **401**; so sánh bằng `secrets.compare_digest`. | Nếu để FastAPI xử lý header bắt buộc thì trả 403/422. `compare_digest` tránh lộ key qua thời gian xử lý. |
+| `rate_limiter.py` | Sliding window log bằng Redis sorted set, chạy trong **một script Lua** (ZREMRANGEBYSCORE → ZCARD → ZADD → EXPIRE). Key Redis là hash SHA-256 của API key. Dùng `TIME` của Redis. | Chạy rời từng lệnh thì 2 worker có thể cùng thấy "còn chỗ" và cùng thêm request, làm vượt giới hạn. Script Lua chạy atomic. Hash để secret không nằm trong tên key Redis. |
+| `cost_guard.py` | Cộng chi phí vào Redis theo ngày và theo tháng (`INCRBYFLOAT`, có TTL); `check_budget()` trước khi gọi LLM, `record_cost()` sau. Vượt `DAILY_BUDGET_USD` hoặc `MONTHLY_BUDGET_USD` thì **402**. | Bám đề trong `DAY14_DELIVERY_CHECKLIST.md` ($10/tháng) và README (theo ngày). |
+| Khi Redis chết | `/health` vẫn 200, `/ready` trả 503, còn `/ask` trả **503** (fail closed). | Không kiểm soát được tốc độ và chi phí thì không nên cho request đi qua. |
+| `redis_client.py` | `redis.from_url(...)` chỉ tạo client, **không ping lúc import**; timeout kết nối 1 giây. | App khởi động được khi Redis chưa sẵn sàng; `/ready` không bị treo khi Redis chết. |
+| Logging | `JsonFormatter` tự viết, `json.dumps` mỗi dòng một object, có `ts`, `lvl`, `event`, `path`, `status`, `ms`. Không bao giờ log API key. | Dễ parse trong log aggregator. |
+| Graceful shutdown | Dùng `lifespan` của FastAPI, **không tự đăng ký handler SIGTERM**. Sau SIGTERM, `/ready` chuyển 503. | uvicorn đã xử lý SIGTERM: ngừng nhận kết nối mới, chờ request đang chạy xong rồi thoát. Tự gắn handler mà không gọi lại handler cũ sẽ làm process không bao giờ tắt. |
+| Dockerfile | 2 stage: builder tạo virtualenv `/opt/venv`, runtime (`python:3.11-slim`) chỉ copy venv và code; user non-root; `HEALTHCHECK` gọi `/health`; `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000}"]`. | `exec` để uvicorn thành PID 1, nhận SIGTERM trực tiếp. `COPY requirements.txt` trước code để tận dụng cache layer. Cổng đọc từ `PORT` cho Render/Railway. |
+| `docker-compose.yml` | Service `agent` (build từ Dockerfile) + `redis:7-alpine` có healthcheck; `REDIS_URL=redis://redis:6379/0`; `depends_on` redis `service_healthy`; `env_file` với `required: false`. | Chạy được bằng `docker compose up` kể cả khi chưa có file `.env`. |
+| Deploy | Viết cả `railway.toml` và `render.yaml` (Render tự sinh `AGENT_API_KEY` bằng `generateValue: true`, Redis là Key Value). | Cần cho tiêu chí 12 và để so sánh hai nền tảng ở Part 3. |
+
+### Kiểm tra thêm ngoài script chấm
+
+Tôi chạy thật `docker compose up --build` với một file `.env` tạm (đã xoá sau đó, và `.env` nằm trong `.gitignore`):
+
+```text
+GET /health -> 200 {"status":"ok",...}        GET /ready -> 200 {"ready":true}
+POST /ask không key     -> 401
+POST /ask đúng key      -> 200 (câu trả lời)
+Lỗi đầu vào (tất cả trả JSON rõ ràng, không có stack trace):
+  question rỗng           -> 422  (String should have at least 1 character)
+  JSON hỏng               -> 422  (JSON decode error)
+  thiếu body              -> 422  (Field required)
+  question dài 2500 ký tự -> 422  (giới hạn 2000)
+  /nope -> 404 {"detail":"Not Found"}    GET /ask -> 405 {"detail":"Method Not Allowed"}
+Rate limit mặc định 10/phút: 9 request 200 rồi 429, header retry-after: 57
+Dừng Redis giữa chừng:
+  /ready -> 503  /health -> 200  /ask -> 503 {"detail":"Service temporarily unavailable"}
+Log container: mỗi dòng là một object JSON hợp lệ
+```
+
+### Môi trường chạy và những điểm cần nói rõ
+
+- **WSL2 và Docker:** Ubuntu trong WSL chưa bật tích hợp Docker Desktop, nên lệnh `docker` không có sẵn. Tôi thêm một script wrapper `~/.local/bin/docker` (chỉ nằm trong thư mục home của WSL, ngoài repo). Nó gọi `docker.exe` của Docker Desktop và đổi đường dẫn `/mnt/d/...` sang dạng Windows. Script chấm vẫn chạy nguyên bản và dùng Docker thật.
+- **Python của WSL:** bản mặc định là 3.14, không cài được `pydantic==2.9.0` trong `requirements.txt`. Tôi tạo virtualenv Python 3.11 bằng `uv` tại `~/k5-venv` (ngoài repo) để chạy script chấm.
+- **Cost guard có thể vượt budget một chút:** `check_budget()` chạy trước và `record_cost()` chạy sau khi gọi LLM, nên request chạy song song có thể làm tổng vượt ngưỡng một ít. Muốn chặt hơn cần "đặt trước" chi phí ước tính trước khi gọi.
+- **Số token là ước lượng:** mock LLM không trả số token thật, nên tôi ước lượng ~4 ký tự mỗi token.
+- **`render.yaml` chưa được thử trên Render thật:** script chấm chỉ kiểm tra cú pháp ở mức tĩnh. Các đường dẫn Docker và cú pháp Redis (Key Value) trong file này cần xác nhận khi deploy ở Part 3.
 
 ## AI log
 
 | Lần | Hỏi gì | Nhận gì | Tôi tự sửa / kiểm tra thế nào |
 |-----|--------|---------|-------------------------------|
+| 5 | Làm Part 6: viết code cho các chỗ TODO trong `06-lab-complete/` (config, auth, rate limiter Redis/Lua, cost guard, log JSON, health/ready, Dockerfile multi-stage, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`); dựng môi trường WSL để chạy script chấm | Toàn bộ code và cấu hình của Part 6, lệnh chạy script chấm trong WSL | Đọc kỹ các phép kiểm tra của script chấm trước khi viết. Chạy script chấm đầy đủ → PASS 12/12, không sửa script. Tự chạy `docker compose up` và thử các trường hợp lỗi (401, 422, 429, Redis chết). Cần bạn đọc và hiểu từng file trong `06-lab-complete/app/` vì Lab Coach có thể hỏi giải thích. |
 | 4 | Làm Part 5: đọc code health/ready, graceful shutdown, Redis session, nginx; chạy develop trong container để gửi SIGTERM thật; dựng stack 3 agent + Redis + Nginx, chạy `test_stateless.py`; thử tắt một instance | Câu trả lời 5.1–5.5, cách xử lý lỗi mạng Docker (build offline), xung đột cổng 8080 (đổi sang 8090 bằng file override ngoài repo) | Tự chạy mọi lệnh và lấy output thật. Bản sao `test_stateless.py` đổi cổng 8080→8090 (file gốc không sửa). Thử nghiệm tắt instance là script do tôi viết thêm, không thuộc lab. Cần bạn đọc lại và xác nhận. |
 | 3 | Làm Part 4: đọc code API key, JWT, rate limiter, cost guard; chạy server và test 401/403/200/429/402; viết phần Part 4 | Câu trả lời 4.1–4.4 và các lệnh test | Tự chạy server, curl và script Python; lần đầu vòng lặp bị 422 do tôi quote JSON sai trong PowerShell, đã chạy lại bằng script Python. 402 minh hoạ bằng cách gọi trực tiếp `CostGuard` (không qua HTTP). Cần bạn đọc lại và xác nhận. |
 | 2 | Làm Part 2: đọc Dockerfile/compose, build và đo image, chạy container và stack, viết phần Part 2 | Câu trả lời 2.1–2.4, cách xử lý lỗi mạng Docker (build offline bằng wheel tải sẵn, Dockerfile tạm đặt ngoài repo), sơ đồ stack | Tự chạy các lệnh build, `docker images`, curl, `docker compose`. Số MB lấy từ output thật. Cần bạn đọc lại và xác nhận trước khi nộp. |
